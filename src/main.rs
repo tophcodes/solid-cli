@@ -53,8 +53,8 @@ async fn fresh_token(s: &mut Session) -> Result<()> {
         return Ok(());
     }
     let rt = s.refresh_token.clone().ok_or_else(|| anyhow!("token expired, no refresh — re-login"))?;
-    let key = key_from_b64(&s.key)?;
-    let proof = dpop_proof(&key, "POST", &s.token_endpoint, None)?;
+    let key = DpopKey::try_from(s.key.as_str())?;
+    let proof = key.proof("POST", &s.token_endpoint, None)?;
     let client = reqwest::Client::new();
     let mut req = client.post(&s.token_endpoint).header("DPoP", proof).form(&[
         ("grant_type", "refresh_token"),
@@ -82,8 +82,8 @@ async fn authed_with(
 ) -> Result<reqwest::Response> {
     let mut s = load()?;
     fresh_token(&mut s).await?;
-    let key = key_from_b64(&s.key)?;
-    let proof = dpop_proof(&key, method.as_str(), url, Some(&s.access_token))?;
+    let key = DpopKey::try_from(s.key.as_str())?;
+    let proof = key.proof(method.as_str(), url, Some(&s.access_token))?;
     let mut req = reqwest::Client::new()
         .request(method, url)
         .header("Authorization", format!("DPoP {}", s.access_token))
@@ -127,7 +127,8 @@ async fn login() -> Result<()> {
     let verifier = rand_b64(32);
     let challenge = s256(&verifier);
     let state = rand_b64(16);
-    let (key, key_b64) = gen_key();
+    let key = DpopKey::generate();
+    let key_b64 = key.to_b64();
 
     let auth_url = format!(
         "{auth_ep}?response_type=code&client_id={cid}&redirect_uri={redir}&scope={scope}&state={state}&code_challenge={ch}&code_challenge_method=S256&prompt=consent",
@@ -142,7 +143,7 @@ async fn login() -> Result<()> {
     let code = tokio::task::spawn_blocking(move || catch_code(&state)).await??;
 
     // 5. token exchange (DPoP-bound)
-    let proof = dpop_proof(&key, "POST", &token_ep, None)?;
+    let proof = key.proof("POST", &token_ep, None)?;
     let mut req = client.post(&token_ep).header("DPoP", proof).form(&[
         ("grant_type", "authorization_code"),
         ("code", code.as_str()),
@@ -174,20 +175,25 @@ fn catch_code(state: &str) -> Result<String> {
         .map_err(|e| anyhow!("callback server: {e}"))?;
     for req in server.incoming_requests() {
         let url = req.url().to_string();
-        let q = url.splitn(2, '?').nth(1).unwrap_or("");
+        let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
         let mut code = None;
         let mut got_state = None;
-        for kv in q.split('&') {
-            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            match k {
-                "code" => code = Some(urldec(v)),
-                "state" => got_state = Some(urldec(v)),
-                _ => {}
+        for kv in query.split('&') {
+            if let Some((k, v)) = kv.split_once('=') {
+                match k {
+                    "code" => code = Some(urldec(v)),
+                    "state" => got_state = Some(urldec(v)),
+                    _ => {}
+                }
             }
         }
         let _ = req.respond(tiny_http::Response::from_string(
             "<h2>Solid CLI: logged in. You can close this tab.</h2>",
         ).with_header("Content-Type: text/html".parse::<tiny_http::Header>().unwrap()));
+        // ignore stray hits (favicon, etc.) that carry no auth params
+        if code.is_none() && got_state.is_none() {
+            continue;
+        }
         if got_state.as_deref() != Some(state) {
             bail!("state mismatch");
         }
@@ -237,8 +243,8 @@ async fn put(path: &str, content_type: Option<String>) -> Result<()> {
     std::io::stdin().read_to_end(&mut body)?;
 
     fresh_token(&mut s).await?;
-    let key = key_from_b64(&s.key)?;
-    let proof = dpop_proof(&key, "PUT", &url, Some(&s.access_token))?;
+    let key = DpopKey::try_from(s.key.as_str())?;
+    let proof = key.proof("PUT", &url, Some(&s.access_token))?;
     let resp = reqwest::Client::new()
         .put(&url)
         .header("Authorization", format!("DPoP {}", s.access_token))

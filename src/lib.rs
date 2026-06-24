@@ -41,40 +41,54 @@ pub fn s256(s: &str) -> String {
     B64.encode(Sha256::digest(s.as_bytes()))
 }
 
-/// Fresh P-256 DPoP keypair; returns the key and its base64url-encoded secret scalar.
-pub fn gen_key() -> (SigningKey, String) {
-    let key = SigningKey::random(&mut rand::rngs::OsRng);
-    let b64 = B64.encode(key.to_bytes());
-    (key, b64)
-}
+/// A P-256 keypair used to sign DPoP proofs. The secret scalar is persisted as
+/// base64url in the session; parse it back with `DpopKey::try_from(&str)`.
+pub struct DpopKey(SigningKey);
 
-pub fn key_from_b64(b64: &str) -> Result<SigningKey> {
-    let bytes = B64.decode(b64)?;
-    Ok(SigningKey::from_bytes(bytes.as_slice().into())?)
-}
-
-/// Build a DPoP proof JWT for (method, url), optionally bound to an access token (ath).
-pub fn dpop_proof(key: &SigningKey, method: &str, url: &str, token: Option<&str>) -> Result<String> {
-    let pt = key.verifying_key().to_encoded_point(false);
-    let jwk = serde_json::json!({
-        "kty": "EC", "crv": "P-256",
-        "x": B64.encode(pt.x().unwrap()),
-        "y": B64.encode(pt.y().unwrap()),
-    });
-    let header = serde_json::json!({ "typ": "dpop+jwt", "alg": "ES256", "jwk": jwk });
-    let mut payload = serde_json::json!({
-        "htu": url, "htm": method, "jti": rand_b64(16), "iat": now(),
-    });
-    if let Some(t) = token {
-        payload["ath"] = serde_json::Value::String(s256(t));
+impl DpopKey {
+    /// Generate a fresh keypair.
+    pub fn generate() -> Self {
+        Self(SigningKey::random(&mut rand::rngs::OsRng))
     }
-    let signing_input = format!(
-        "{}.{}",
-        B64.encode(serde_json::to_vec(&header)?),
-        B64.encode(serde_json::to_vec(&payload)?),
-    );
-    let sig: Signature = key.sign(signing_input.as_bytes());
-    Ok(format!("{}.{}", signing_input, B64.encode(sig.to_bytes())))
+
+    /// base64url-encoded secret scalar, for storing in the session.
+    pub fn to_b64(&self) -> String {
+        B64.encode(self.0.to_bytes())
+    }
+
+    /// Build a DPoP proof JWT for (method, url), optionally bound to an access token (ath).
+    pub fn proof(&self, method: &str, url: &str, token: Option<&str>) -> Result<String> {
+        let pt = self.0.verifying_key().to_encoded_point(false);
+        let jwk = serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": B64.encode(pt.x().unwrap()),
+            "y": B64.encode(pt.y().unwrap()),
+        });
+        let header = serde_json::json!({ "typ": "dpop+jwt", "alg": "ES256", "jwk": jwk });
+        let mut payload = serde_json::json!({
+            "htu": url, "htm": method, "jti": rand_b64(16), "iat": now(),
+        });
+        if let Some(t) = token {
+            payload["ath"] = serde_json::Value::String(s256(t));
+        }
+        let signing_input = format!(
+            "{}.{}",
+            B64.encode(serde_json::to_vec(&header)?),
+            B64.encode(serde_json::to_vec(&payload)?),
+        );
+        let sig: Signature = self.0.sign(signing_input.as_bytes());
+        Ok(format!("{}.{}", signing_input, B64.encode(sig.to_bytes())))
+    }
+}
+
+/// Parse a key from the base64url secret scalar stored in the session. Fallible
+/// (the input may be malformed), hence `TryFrom` rather than `From`.
+impl TryFrom<&str> for DpopKey {
+    type Error = anyhow::Error;
+    fn try_from(b64: &str) -> Result<Self> {
+        let bytes = B64.decode(b64)?;
+        Ok(Self(SigningKey::from_bytes(bytes.as_slice().into())?))
+    }
 }
 
 pub fn apply_token(s: &mut Session, t: TokenResp) {
@@ -198,8 +212,8 @@ mod tests {
 
     #[test]
     fn dpop_is_valid_es256_with_claims() {
-        let (key, _) = gen_key();
-        let jwt = dpop_proof(&key, "GET", "https://pod/x", Some("tok")).unwrap();
+        let key = DpopKey::generate();
+        let jwt = key.proof("GET", "https://pod/x", Some("tok")).unwrap();
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
 
@@ -217,15 +231,15 @@ mod tests {
 
         // signature verifies against the embedded public key
         let sig = Signature::from_slice(&B64.decode(parts[2]).unwrap()).unwrap();
-        let vk = VerifyingKey::from(&key);
+        let vk = VerifyingKey::from(&key.0); // same-crate test reaches the inner key
         let signing_input = format!("{}.{}", parts[0], parts[1]);
         assert!(vk.verify(signing_input.as_bytes(), &sig).is_ok());
     }
 
     #[test]
     fn no_ath_without_token() {
-        let (key, _) = gen_key();
-        let jwt = dpop_proof(&key, "POST", "https://idp/token", None).unwrap();
+        let key = DpopKey::generate();
+        let jwt = key.proof("POST", "https://idp/token", None).unwrap();
         let payload: serde_json::Value =
             serde_json::from_slice(&B64.decode(jwt.split('.').nth(1).unwrap()).unwrap()).unwrap();
         assert!(payload.get("ath").is_none());

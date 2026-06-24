@@ -115,8 +115,9 @@ fn mint_session(
         .send().unwrap().json().unwrap();
     let token_ep = disc["token_endpoint"].as_str().expect("token_endpoint").to_string();
 
-    let (key, key_b64) = solid::gen_key();
-    let proof = solid::dpop_proof(&key, "POST", &token_ep, None).unwrap();
+    let key = solid::DpopKey::generate();
+    let key_b64 = key.to_b64();
+    let proof = key.proof("POST", &token_ep, None).unwrap();
     let resp = c.post(&token_ep)
         .header("DPoP", proof)
         .basic_auth(id, Some(secret))
