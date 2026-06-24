@@ -1,13 +1,8 @@
 // solid — tiny LDP CRUD CLI over Solid pods. Solid-OIDC login w/ DPoP-bound tokens.
 use anyhow::{anyhow, bail, Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use clap::{Parser, Subcommand};
-use p256::ecdsa::{signature::Signer, Signature, SigningKey};
-use rand::RngCore;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use solid::*;
 use std::io::{Read, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const REDIRECT: &str = "http://localhost:9876/callback";
 const SCOPE: &str = "openid webid offline_access";
@@ -38,19 +33,6 @@ enum Cmd {
     Rm { path: String },
 }
 
-#[derive(Serialize, Deserialize)]
-struct Session {
-    issuer: String,
-    base: String,
-    token_endpoint: String,
-    client_id: String,
-    client_secret: Option<String>,
-    refresh_token: Option<String>,
-    access_token: String,
-    expires_at: u64,
-    key: String, // base64url of P-256 secret scalar (32 bytes)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -63,77 +45,6 @@ async fn main() -> Result<()> {
     }
 }
 
-// ---------- helpers ----------
-
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
-}
-
-fn rand_b64(n: usize) -> String {
-    let mut buf = vec![0u8; n];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
-    B64.encode(buf)
-}
-
-fn s256(s: &str) -> String {
-    B64.encode(Sha256::digest(s.as_bytes()))
-}
-
-fn config_path() -> Result<std::path::PathBuf> {
-    let dir = dirs::config_dir().ok_or_else(|| anyhow!("no config dir"))?.join("solid");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("session.json"))
-}
-
-fn load() -> Result<Session> {
-    let p = config_path()?;
-    let raw = std::fs::read_to_string(&p)
-        .map_err(|_| anyhow!("not logged in — run `solid login`"))?;
-    Ok(serde_json::from_str(&raw)?)
-}
-
-fn save(s: &Session) -> Result<()> {
-    std::fs::write(config_path()?, serde_json::to_string_pretty(s)?)?;
-    Ok(())
-}
-
-fn signing_key(s: &Session) -> Result<SigningKey> {
-    let bytes = B64.decode(&s.key)?;
-    Ok(SigningKey::from_bytes(bytes.as_slice().into())?)
-}
-
-/// Build a DPoP proof JWT for (method, url), optionally bound to an access token (ath).
-fn dpop_proof(key: &SigningKey, method: &str, url: &str, token: Option<&str>) -> Result<String> {
-    let pt = key.verifying_key().to_encoded_point(false);
-    let jwk = serde_json::json!({
-        "kty": "EC", "crv": "P-256",
-        "x": B64.encode(pt.x().unwrap()),
-        "y": B64.encode(pt.y().unwrap()),
-    });
-    let header = serde_json::json!({ "typ": "dpop+jwt", "alg": "ES256", "jwk": jwk });
-    let mut payload = serde_json::json!({
-        "htu": url, "htm": method, "jti": rand_b64(16), "iat": now(),
-    });
-    if let Some(t) = token {
-        payload["ath"] = serde_json::Value::String(s256(t));
-    }
-    let signing_input = format!(
-        "{}.{}",
-        B64.encode(serde_json::to_vec(&header)?),
-        B64.encode(serde_json::to_vec(&payload)?),
-    );
-    let sig: Signature = key.sign(signing_input.as_bytes());
-    Ok(format!("{}.{}", signing_input, B64.encode(sig.to_bytes())))
-}
-
-fn resolve(base: &str, path: &str) -> String {
-    if path.starts_with("http://") || path.starts_with("https://") {
-        path.to_string()
-    } else {
-        format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
-    }
-}
-
 // ---------- auth ----------
 
 /// Ensure a fresh access token, refreshing via the DPoP-bound refresh_token if expired.
@@ -142,18 +53,15 @@ async fn fresh_token(s: &mut Session) -> Result<()> {
         return Ok(());
     }
     let rt = s.refresh_token.clone().ok_or_else(|| anyhow!("token expired, no refresh — re-login"))?;
-    let key = signing_key(s)?;
+    let key = key_from_b64(&s.key)?;
     let proof = dpop_proof(&key, "POST", &s.token_endpoint, None)?;
     let client = reqwest::Client::new();
-    let mut req = client
-        .post(&s.token_endpoint)
-        .header("DPoP", proof)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", rt.as_str()),
-            ("scope", SCOPE),
-            ("client_id", s.client_id.as_str()),
-        ]);
+    let mut req = client.post(&s.token_endpoint).header("DPoP", proof).form(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", rt.as_str()),
+        ("scope", SCOPE),
+        ("client_id", s.client_id.as_str()),
+    ]);
     if let Some(sec) = &s.client_secret {
         req = req.basic_auth(&s.client_id, Some(sec));
     }
@@ -161,30 +69,9 @@ async fn fresh_token(s: &mut Session) -> Result<()> {
     if !resp.status().is_success() {
         bail!("refresh failed: {}", resp.text().await.unwrap_or_default());
     }
-    let tok: TokenResp = resp.json().await?;
-    apply_token(s, tok);
+    apply_token(s, resp.json().await?);
     save(s)?;
     Ok(())
-}
-
-#[derive(Deserialize)]
-struct TokenResp {
-    access_token: String,
-    expires_in: Option<u64>,
-    refresh_token: Option<String>,
-}
-
-fn apply_token(s: &mut Session, t: TokenResp) {
-    s.access_token = t.access_token;
-    s.expires_at = now() + t.expires_in.unwrap_or(3600).saturating_sub(30);
-    if t.refresh_token.is_some() {
-        s.refresh_token = t.refresh_token;
-    }
-}
-
-/// Authenticated request: attach DPoP-bound bearer + per-request proof.
-async fn authed(method: reqwest::Method, url: &str) -> Result<(reqwest::Response, Session)> {
-    authed_with(method, url, None).await
 }
 
 /// Authenticated request with an optional Accept header.
@@ -192,10 +79,10 @@ async fn authed_with(
     method: reqwest::Method,
     url: &str,
     accept: Option<&str>,
-) -> Result<(reqwest::Response, Session)> {
+) -> Result<reqwest::Response> {
     let mut s = load()?;
     fresh_token(&mut s).await?;
-    let key = signing_key(&s)?;
+    let key = key_from_b64(&s.key)?;
     let proof = dpop_proof(&key, method.as_str(), url, Some(&s.access_token))?;
     let mut req = reqwest::Client::new()
         .request(method, url)
@@ -204,7 +91,7 @@ async fn authed_with(
     if let Some(a) = accept {
         req = req.header("Accept", a);
     }
-    Ok((req.send().await?, s))
+    Ok(req.send().await?)
 }
 
 // ---------- login ----------
@@ -240,8 +127,7 @@ async fn login() -> Result<()> {
     let verifier = rand_b64(32);
     let challenge = s256(&verifier);
     let state = rand_b64(16);
-    let key = SigningKey::random(&mut rand::rngs::OsRng);
-    let key_b64 = B64.encode(key.to_bytes());
+    let (key, key_b64) = gen_key();
 
     let auth_url = format!(
         "{auth_ep}?response_type=code&client_id={cid}&redirect_uri={redir}&scope={scope}&state={state}&code_challenge={ch}&code_challenge_method=S256&prompt=consent",
@@ -271,14 +157,13 @@ async fn login() -> Result<()> {
     if !resp.status().is_success() {
         bail!("token exchange failed: {}", resp.text().await.unwrap_or_default());
     }
-    let tok: TokenResp = resp.json().await?;
 
     let mut s = Session {
         issuer, base: base.trim_end_matches('/').to_string(),
         token_endpoint: token_ep, client_id, client_secret,
         refresh_token: None, access_token: String::new(), expires_at: 0, key: key_b64,
     };
-    apply_token(&mut s, tok);
+    apply_token(&mut s, resp.json().await?);
     save(&s)?;
     println!("Logged in. Session at {}", config_path()?.display());
     Ok(())
@@ -319,7 +204,7 @@ async fn ls(path: &str) -> Result<()> {
     if !url.ends_with('/') {
         url.push('/');
     }
-    let (resp, _) = authed_with(reqwest::Method::GET, &url, Some("text/turtle")).await?;
+    let resp = authed_with(reqwest::Method::GET, &url, Some("text/turtle")).await?;
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
@@ -334,7 +219,7 @@ async fn ls(path: &str) -> Result<()> {
 
 async fn cat(path: &str) -> Result<()> {
     let url = resolve(&load()?.base, path);
-    let (resp, _) = authed(reqwest::Method::GET, &url).await?;
+    let resp = authed_with(reqwest::Method::GET, &url, None).await?;
     let status = resp.status();
     let bytes = resp.bytes().await?;
     if !status.is_success() {
@@ -352,7 +237,7 @@ async fn put(path: &str, content_type: Option<String>) -> Result<()> {
     std::io::stdin().read_to_end(&mut body)?;
 
     fresh_token(&mut s).await?;
-    let key = signing_key(&s)?;
+    let key = key_from_b64(&s.key)?;
     let proof = dpop_proof(&key, "PUT", &url, Some(&s.access_token))?;
     let resp = reqwest::Client::new()
         .put(&url)
@@ -370,53 +255,12 @@ async fn put(path: &str, content_type: Option<String>) -> Result<()> {
 
 async fn rm(path: &str) -> Result<()> {
     let url = resolve(&load()?.base, path);
-    let (resp, _) = authed(reqwest::Method::DELETE, &url).await?;
+    let resp = authed_with(reqwest::Method::DELETE, &url, None).await?;
     if !resp.status().is_success() {
         bail!("{}: {}", resp.status(), resp.text().await.unwrap_or_default());
     }
     println!("DELETE {url}");
     Ok(())
-}
-
-// ---------- tiny parsers / utils ----------
-
-/// Pull child IRIs out of `ldp:contains` statements without a full Turtle parser.
-fn parse_contains(ttl: &str) -> Vec<String> {
-    let norm = ttl.replace("<http://www.w3.org/ns/ldp#contains>", "ldp:contains");
-    let mut out = Vec::new();
-    let mut rest = norm.as_str();
-    while let Some(i) = rest.find("ldp:contains") {
-        let after = &rest[i + "ldp:contains".len()..];
-        // capture <...> tokens until end of statement ('.') or new predicate (';')
-        let end = after.find(['.', ';']).unwrap_or(after.len());
-        let stmt = &after[..end];
-        let mut idx = 0;
-        while let Some(open) = stmt[idx..].find('<') {
-            let start = idx + open + 1;
-            if let Some(close) = stmt[start..].find('>') {
-                out.push(stmt[start..start + close].to_string());
-                idx = start + close + 1;
-            } else {
-                break;
-            }
-        }
-        rest = &after[end..];
-    }
-    out
-}
-
-fn guess_type(url: &str) -> String {
-    let ext = url.rsplit('.').next().unwrap_or("");
-    match ext {
-        "ttl" => "text/turtle",
-        "json" => "application/json",
-        "jsonld" => "application/ld+json",
-        "txt" => "text/plain",
-        "html" | "htm" => "text/html",
-        "md" => "text/markdown",
-        "csv" => "text/csv",
-        _ => "application/octet-stream",
-    }.to_string()
 }
 
 fn prompt(label: &str, default: &str) -> Result<String> {
@@ -426,33 +270,4 @@ fn prompt(label: &str, default: &str) -> Result<String> {
     std::io::stdin().read_line(&mut line)?;
     let line = line.trim();
     Ok(if line.is_empty() { default.to_string() } else { line.to_string() })
-}
-
-fn urlenc(s: &str) -> String {
-    s.bytes().map(|b| match b {
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-        _ => format!("%{:02X}", b),
-    }).collect()
-}
-
-fn urldec(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(h) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(h);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
-                i += 1;
-            }
-            b'+' => { out.push(b' '); i += 1; }
-            c => { out.push(c); i += 1; }
-        }
-    }
-    String::from_utf8_lossy(&out).to_string()
 }
