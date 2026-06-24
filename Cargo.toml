@@ -2,6 +2,9 @@
 name = "solid"
 version = "0.1.0"
 edition = "2021"
+description = "Small, fast CLI for LDP CRUD over Solid pods, with Solid-OIDC + DPoP login"
+license = "MIT"
+repository = "https://github.com/tophcodes/solid-cli"
 
 [[bin]]
 name = "solid"
