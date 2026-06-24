@@ -14,6 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PORT: u16 = 3030;
+const PORT2: u16 = 3031;
 const BIN: &str = env!("CARGO_BIN_EXE_solid");
 
 /// Unique-ish suffix so a reused/leftover server doesn't collide on account/pod names.
@@ -36,14 +37,14 @@ fn npx_available() -> bool {
     Command::new("npx").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
-fn start_css() -> Option<(Css, String)> {
-    let dir = std::env::temp_dir().join(format!("solid-css-test-{PORT}"));
+fn start_css(port: u16) -> Option<(Css, String)> {
+    let dir = std::env::temp_dir().join(format!("solid-css-test-{port}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;
     let child = Command::new("npx")
         .args([
             "--yes", "@solid/community-server",
-            "-p", &PORT.to_string(),
+            "-p", &port.to_string(),
             "-l", "error",
             "-c", "@css:config/default.json",
             "-f", dir.to_str().unwrap(),
@@ -53,7 +54,7 @@ fn start_css() -> Option<(Css, String)> {
         .process_group(0) // own group → Drop can kill node grandchild too
         .spawn()
         .ok()?;
-    let base = format!("http://localhost:{PORT}");
+    let base = format!("http://localhost:{port}");
     let probe = format!("{base}/.account/");
     for _ in 0..120 {
         if reqwest::blocking::get(&probe).map(|r| r.status().is_success()).unwrap_or(false) {
@@ -163,7 +164,7 @@ fn crud_roundtrip_against_css() {
         eprintln!("SKIP: npx not available — cannot start Community Solid Server");
         return;
     }
-    let Some((_css, base)) = start_css() else {
+    let Some((_css, base)) = start_css(PORT) else {
         eprintln!("SKIP: Community Solid Server did not come up");
         return;
     };
@@ -205,4 +206,80 @@ fn crud_roundtrip_against_css() {
     assert!(!out.status.success(), "cat of deleted resource should fail");
 
     let _ = std::fs::remove_file(&session_file);
+}
+
+/// Provision a fresh pod and return a ready-to-use session for it.
+fn fresh_session(http: &reqwest::blocking::Client, base: &str) -> solid::Session {
+    let (pod_base, _webid, id, secret) = provision(http, base);
+    mint_session(http, base, &pod_base, &id, &secret)
+}
+
+/// Run the binary with a profiles directory (`$SOLID_CONFIG_DIR`) and optional stdin.
+fn solid_cfg(cfg_dir: &str, args: &[&str], stdin: Option<&[u8]>) -> std::process::Output {
+    let mut child = Command::new(BIN)
+        .env("SOLID_CONFIG_DIR", cfg_dir)
+        .env_remove("SOLID_SESSION")
+        .args(args)
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    if let Some(data) = stdin {
+        child.stdin.take().unwrap().write_all(data).unwrap();
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn multi_profile_addressing() {
+    if !npx_available() {
+        eprintln!("SKIP: npx not available — cannot start Community Solid Server");
+        return;
+    }
+    let Some((_css, base)) = start_css(PORT2) else {
+        eprintln!("SKIP: Community Solid Server did not come up");
+        return;
+    };
+
+    // Two independent pods on the same server -> two profiles.
+    let http = reqwest::blocking::Client::new();
+    let work = fresh_session(&http, &base);
+    let perso = fresh_session(&http, &base);
+
+    let cfg = std::env::temp_dir().join(format!("solid-cfg-{PORT2}"));
+    let _ = std::fs::remove_dir_all(&cfg);
+    let profiles = cfg.join("profiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(profiles.join("work.json"), serde_json::to_string(&work).unwrap()).unwrap();
+    std::fs::write(profiles.join("perso.json"), serde_json::to_string(&perso).unwrap()).unwrap();
+    std::fs::write(cfg.join("config.json"), r#"{"default":"work"}"#).unwrap();
+    let c = cfg.to_str().unwrap();
+
+    // bare path -> default profile (work)
+    let out = solid_cfg(c, &["put", "a.txt"], Some(b"alpha"));
+    assert!(out.status.success(), "put work failed: {}", String::from_utf8_lossy(&out.stderr));
+    // inline alias -> perso
+    let out = solid_cfg(c, &["put", "perso:b.txt"], Some(b"beta"));
+    assert!(out.status.success(), "put perso failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // each pod sees only its own resource — profiles are isolated
+    let work_ls = String::from_utf8_lossy(&solid_cfg(c, &["ls", "/"], None).stdout).into_owned();
+    assert!(work_ls.contains("a.txt"), "work missing a.txt:\n{work_ls}");
+    assert!(!work_ls.contains("b.txt"), "work leaked b.txt:\n{work_ls}");
+
+    let perso_ls = String::from_utf8_lossy(&solid_cfg(c, &["ls", "perso:/"], None).stdout).into_owned();
+    assert!(perso_ls.contains("b.txt"), "perso missing b.txt:\n{perso_ls}");
+    assert!(!perso_ls.contains("a.txt"), "perso leaked a.txt:\n{perso_ls}");
+
+    // inline alias and --profile flag both reach perso
+    assert_eq!(solid_cfg(c, &["cat", "perso:b.txt"], None).stdout, b"beta");
+    assert_eq!(solid_cfg(c, &["--profile", "perso", "cat", "b.txt"], None).stdout, b"beta");
+
+    // `profiles` lists both, default marked
+    let listing = String::from_utf8_lossy(&solid_cfg(c, &["profiles"], None).stdout).into_owned();
+    assert!(listing.contains("work") && listing.contains("perso"), "profiles:\n{listing}");
+    assert!(listing.contains("* work"), "default not marked:\n{listing}");
+
+    let _ = std::fs::remove_dir_all(&cfg);
 }

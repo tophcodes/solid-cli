@@ -10,14 +10,27 @@ const SCOPE: &str = "openid webid offline_access";
 #[derive(Parser)]
 #[command(name = "solid", about = "Tiny LDP CRUD over Solid pods")]
 struct Cli {
+    /// Profile to use for this command (overrides the default; `alias:path` wins over this)
+    #[arg(short = 'p', long, global = true)]
+    profile: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Interactive OIDC login
-    Login,
+    /// Interactive OIDC login, stored as a named profile
+    Login {
+        /// Profile name to log in as
+        #[arg(long = "as", value_name = "NAME", default_value = "default")]
+        name: String,
+    },
+    /// List profiles (the default is marked with *)
+    Profiles,
+    /// Set the default profile
+    Use { name: String },
+    /// Remove a profile
+    Logout { name: Option<String> },
     /// List container contents
     Ls { path: String },
     /// Print a resource to stdout
@@ -36,19 +49,38 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let p = cli.profile.as_deref();
     match cli.cmd {
-        Cmd::Login => login().await,
-        Cmd::Ls { path } => ls(&path).await,
-        Cmd::Cat { path } => cat(&path).await,
-        Cmd::Put { path, content_type } => put(&path, content_type).await,
-        Cmd::Rm { path } => rm(&path).await,
+        Cmd::Login { name } => login(&name).await,
+        Cmd::Profiles => profiles(),
+        Cmd::Use { name } => use_profile(&name),
+        Cmd::Logout { name } => logout(name),
+        Cmd::Ls { path } => ls(&path, p).await,
+        Cmd::Cat { path } => cat(&path, p).await,
+        Cmd::Put { path, content_type } => put(&path, content_type, p).await,
+        Cmd::Rm { path } => rm(&path, p).await,
     }
+}
+
+// ---------- addressing ----------
+
+/// Resolve a path argument to (profile name, its session, target URL).
+/// Profile selection: inline `alias:` > `--profile` flag > configured default.
+fn resolve_target(raw: &str, flag: Option<&str>) -> Result<(String, Session, String)> {
+    let (inline, locator) = parse_locator(raw, &list_profiles());
+    let name = inline
+        .or_else(|| flag.map(String::from))
+        .or_else(default_profile)
+        .ok_or_else(|| anyhow!("no profile — run `solid login` or use `profile:path`"))?;
+    let session = load_profile(&name)?;
+    let url = resolve(&session.base, locator);
+    Ok((name, session, url))
 }
 
 // ---------- auth ----------
 
 /// Ensure a fresh access token, refreshing via the DPoP-bound refresh_token if expired.
-async fn fresh_token(s: &mut Session) -> Result<()> {
+async fn fresh_token(name: &str, s: &mut Session) -> Result<()> {
     if now() < s.expires_at {
         return Ok(());
     }
@@ -70,18 +102,17 @@ async fn fresh_token(s: &mut Session) -> Result<()> {
         bail!("refresh failed: {}", resp.text().await.unwrap_or_default());
     }
     apply_token(s, resp.json().await?);
-    save(s)?;
+    save_profile(name, s)?;
     Ok(())
 }
 
-/// Authenticated request with an optional Accept header.
-async fn authed_with(
+/// Sign an LDP request with a DPoP proof bound to the session's access token and send it.
+async fn send_signed(
     method: reqwest::Method,
     url: &str,
     accept: Option<&str>,
+    s: &Session,
 ) -> Result<reqwest::Response> {
-    let mut s = load()?;
-    fresh_token(&mut s).await?;
     let key = DpopKey::try_from(s.key.as_str())?;
     let proof = key.proof(method.as_str(), url, Some(&s.access_token))?;
     let mut req = reqwest::Client::new()
@@ -94,9 +125,9 @@ async fn authed_with(
     Ok(req.send().await?)
 }
 
-// ---------- login ----------
+// ---------- profile management ----------
 
-async fn login() -> Result<()> {
+async fn login(name: &str) -> Result<()> {
     let issuer = prompt("Issuer (OIDC provider)", "https://solidcommunity.net")?;
     let issuer = issuer.trim_end_matches('/').to_string();
     let base = prompt("Pod base URL", &issuer)?;
@@ -165,8 +196,44 @@ async fn login() -> Result<()> {
         refresh_token: None, access_token: String::new(), expires_at: 0, key: key_b64,
     };
     apply_token(&mut s, resp.json().await?);
-    save(&s)?;
-    println!("Logged in. Session at {}", config_path()?.display());
+
+    let first = list_profiles().is_empty();
+    save_profile(name, &s)?;
+    if first {
+        set_default(name)?;
+    }
+    println!("Logged in as '{name}'. Profile at {}", profile_path(name)?.display());
+    Ok(())
+}
+
+fn profiles() -> Result<()> {
+    let names = list_profiles();
+    if names.is_empty() {
+        println!("no profiles — run `solid login`");
+        return Ok(());
+    }
+    let def = default_profile();
+    for name in names {
+        let marker = if def.as_deref() == Some(&name) { "*" } else { " " };
+        let base = load_profile(&name).map(|s| s.base).unwrap_or_default();
+        println!("{marker} {name}\t{base}");
+    }
+    Ok(())
+}
+
+fn use_profile(name: &str) -> Result<()> {
+    if !list_profiles().iter().any(|p| p == name) {
+        bail!("no such profile: {name}");
+    }
+    set_default(name)?;
+    println!("default profile: {name}");
+    Ok(())
+}
+
+fn logout(name: Option<String>) -> Result<()> {
+    let name = name.or_else(default_profile).ok_or_else(|| anyhow!("no profile to remove"))?;
+    remove_profile(&name)?;
+    println!("removed profile: {name}");
     Ok(())
 }
 
@@ -204,28 +271,29 @@ fn catch_code(state: &str) -> Result<String> {
 
 // ---------- commands ----------
 
-async fn ls(path: &str) -> Result<()> {
-    let s = load()?;
-    let mut url = resolve(&s.base, path);
+async fn ls(path: &str, flag: Option<&str>) -> Result<()> {
+    let (name, mut s, mut url) = resolve_target(path, flag)?;
     if !url.ends_with('/') {
         url.push('/');
     }
-    let resp = authed_with(reqwest::Method::GET, &url, Some("text/turtle")).await?;
+    fresh_token(&name, &mut s).await?;
+    let resp = send_signed(reqwest::Method::GET, &url, Some("text/turtle"), &s).await?;
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
         bail!("{status}: {body}");
     }
     for child in parse_contains(&body) {
-        let name = child.trim_start_matches(url.as_str());
-        println!("{}", if name.is_empty() { &child } else { name });
+        let short = child.trim_start_matches(url.as_str());
+        println!("{}", if short.is_empty() { &child } else { short });
     }
     Ok(())
 }
 
-async fn cat(path: &str) -> Result<()> {
-    let url = resolve(&load()?.base, path);
-    let resp = authed_with(reqwest::Method::GET, &url, None).await?;
+async fn cat(path: &str, flag: Option<&str>) -> Result<()> {
+    let (name, mut s, url) = resolve_target(path, flag)?;
+    fresh_token(&name, &mut s).await?;
+    let resp = send_signed(reqwest::Method::GET, &url, None, &s).await?;
     let status = resp.status();
     let bytes = resp.bytes().await?;
     if !status.is_success() {
@@ -235,14 +303,13 @@ async fn cat(path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn put(path: &str, content_type: Option<String>) -> Result<()> {
-    let mut s = load()?;
-    let url = resolve(&s.base, path);
+async fn put(path: &str, content_type: Option<String>, flag: Option<&str>) -> Result<()> {
+    let (name, mut s, url) = resolve_target(path, flag)?;
     let ct = content_type.unwrap_or_else(|| guess_type(&url));
     let mut body = Vec::new();
     std::io::stdin().read_to_end(&mut body)?;
 
-    fresh_token(&mut s).await?;
+    fresh_token(&name, &mut s).await?;
     let key = DpopKey::try_from(s.key.as_str())?;
     let proof = key.proof("PUT", &url, Some(&s.access_token))?;
     let resp = reqwest::Client::new()
@@ -259,9 +326,10 @@ async fn put(path: &str, content_type: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn rm(path: &str) -> Result<()> {
-    let url = resolve(&load()?.base, path);
-    let resp = authed_with(reqwest::Method::DELETE, &url, None).await?;
+async fn rm(path: &str, flag: Option<&str>) -> Result<()> {
+    let (name, mut s, url) = resolve_target(path, flag)?;
+    fresh_token(&name, &mut s).await?;
+    let resp = send_signed(reqwest::Method::DELETE, &url, None, &s).await?;
     if !resp.status().is_success() {
         bail!("{}: {}", resp.status(), resp.text().await.unwrap_or_default());
     }

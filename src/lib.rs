@@ -99,29 +99,115 @@ pub fn apply_token(s: &mut Session, t: TokenResp) {
     }
 }
 
-/// Session file path. Honors `$SOLID_SESSION` (used by tests), else `~/.config/solid/session.json`.
-pub fn config_path() -> Result<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("SOLID_SESSION") {
-        let pb = std::path::PathBuf::from(p);
-        if let Some(parent) = pb.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        return Ok(pb);
-    }
-    let dir = dirs::config_dir().ok_or_else(|| anyhow!("no config dir"))?.join("solid");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("session.json"))
+// ---------- profiles ----------
+//
+// Each profile is one Session, stored at `<config>/profiles/<name>.json`. The
+// chosen default lives in `<config>/config.json`. Env overrides:
+//   $SOLID_SESSION    — single-file mode: one profile named "default" at that path
+//                       (used by the e2e test; keeps the simple case trivial).
+//   $SOLID_CONFIG_DIR — base directory instead of ~/.config/solid.
+use std::path::PathBuf;
+
+fn single_file() -> Option<PathBuf> {
+    std::env::var("SOLID_SESSION").ok().map(PathBuf::from)
 }
 
-pub fn load() -> Result<Session> {
-    let raw = std::fs::read_to_string(config_path()?)
-        .map_err(|_| anyhow!("not logged in — run `solid login`"))?;
+fn base_dir() -> Result<PathBuf> {
+    let dir = match std::env::var("SOLID_CONFIG_DIR") {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => dirs::config_dir().ok_or_else(|| anyhow!("no config dir"))?.join("solid"),
+    };
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn profile_path(name: &str) -> Result<PathBuf> {
+    if let Some(p) = single_file() {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        return Ok(p);
+    }
+    let dir = base_dir()?.join("profiles");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join(format!("{name}.json")))
+}
+
+pub fn load_profile(name: &str) -> Result<Session> {
+    let raw = std::fs::read_to_string(profile_path(name)?)
+        .map_err(|_| anyhow!("no profile '{name}' — run `solid login --as {name}`"))?;
     Ok(serde_json::from_str(&raw)?)
 }
 
-pub fn save(s: &Session) -> Result<()> {
-    std::fs::write(config_path()?, serde_json::to_string_pretty(s)?)?;
+pub fn save_profile(name: &str, s: &Session) -> Result<()> {
+    std::fs::write(profile_path(name)?, serde_json::to_string_pretty(s)?)?;
     Ok(())
+}
+
+pub fn list_profiles() -> Vec<String> {
+    if single_file().is_some() {
+        return vec!["default".to_string()];
+    }
+    let Ok(dir) = base_dir().map(|d| d.join("profiles")) else { return vec![] };
+    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix(".json").map(String::from))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The active profile: explicit config default, else the sole profile, else none.
+pub fn default_profile() -> Option<String> {
+    if single_file().is_some() {
+        return Some("default".to_string());
+    }
+    let profiles = list_profiles();
+    if let Ok(raw) = std::fs::read_to_string(base_dir().ok()?.join("config.json")) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(d) = cfg["default"].as_str() {
+                if profiles.iter().any(|p| p == d) {
+                    return Some(d.to_string());
+                }
+            }
+        }
+    }
+    match profiles.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
+}
+
+pub fn set_default(name: &str) -> Result<()> {
+    if single_file().is_some() {
+        return Ok(());
+    }
+    let path = base_dir()?.join("config.json");
+    std::fs::write(path, serde_json::to_string_pretty(&serde_json::json!({ "default": name }))?)?;
+    Ok(())
+}
+
+pub fn remove_profile(name: &str) -> Result<()> {
+    std::fs::remove_file(profile_path(name)?)?;
+    Ok(())
+}
+
+/// Split a path argument into (profile override, locator). A leading `alias:` is
+/// only treated as a profile when `alias` is a known profile name; full `http(s)://`
+/// URLs and ordinary relative paths pass through untouched.
+pub fn parse_locator<'a>(raw: &'a str, known: &[String]) -> (Option<String>, &'a str) {
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return (None, raw);
+    }
+    if let Some((maybe, rest)) = raw.split_once(':') {
+        let valid = !maybe.is_empty()
+            && maybe.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if valid && known.iter().any(|p| p == maybe) {
+            return (Some(maybe.to_string()), rest);
+        }
+    }
+    (None, raw)
 }
 
 pub fn resolve(base: &str, path: &str) -> String {
@@ -286,5 +372,19 @@ mod tests {
     fn url_roundtrip() {
         let s = "a b/c?d=e&f";
         assert_eq!(urldec(&urlenc(s)), s);
+    }
+
+    #[test]
+    fn locator_parsing() {
+        let known = vec!["work".to_string(), "perso".to_string()];
+        // known alias prefix -> split off
+        assert_eq!(parse_locator("work:notes/x.md", &known), (Some("work".into()), "notes/x.md"));
+        assert_eq!(parse_locator("perso:", &known), (Some("perso".into()), ""));
+        // bare path -> no profile
+        assert_eq!(parse_locator("notes/x.md", &known), (None, "notes/x.md"));
+        // unknown alias is treated as a plain path, not a profile
+        assert_eq!(parse_locator("bogus:x", &known), (None, "bogus:x"));
+        // full URLs pass through even though they contain ':'
+        assert_eq!(parse_locator("https://h/p/x", &known), (None, "https://h/p/x"));
     }
 }
